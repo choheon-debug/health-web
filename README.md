@@ -7,8 +7,13 @@
 - 주간 식단 짜기(표), 질문하기, 다시보기(최근 30개)
 - 참고한 웹 자료 링크, 내용 복사·보내기
 
-## API 키
-코드에는 API 키가 들어 있지 않습니다. 앱의 ⚙ 설정에서 각자 Gemini API 키(https://aistudio.google.com/apikey)를 넣으면 그 휴대폰에만 저장되고, 구글 AI로 바로 요청합니다.
+## AI 중계 서버 (키 없이 쓰기)
+`server/worker.js`는 Cloudflare Worker용 중계 서버입니다. 관리자의 Gemini API 키를 Cloudflare 비밀 변수 `GEMINI_KEY`에만 넣어 두고, 앱은 `index.html`의 `PROXY_URL`로 질문을 보냅니다. 그래서 앱을 쓰는 사람은 키가 필요 없습니다.
+- 이 앱 주소(https://choheon-debug.github.io)에서 온 요청만 받음
+- 한 사람당 1분 8회, 하루 150회까지
+- 쓸 수 있는 최신 Flash 모델을 자동으로 고름 (옛 모델이 없어져도 따라감)
+
+앱의 ⚙ 설정 → 고급에서 각자 키를 넣으면 중계 서버 대신 그 키로 바로 요청합니다.
 
 ## 배포
 GitHub Pages (Settings → Pages → Branch: `main`, 폴더 `/ (root)`).

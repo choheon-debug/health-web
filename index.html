@@ -95,6 +95,7 @@ textarea.inp{resize:none}
 .field{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}
 .field label{font-weight:700;font-size:.92rem}
 .field small{color:var(--muted);font-size:.8rem;line-height:1.5}
+.field summary{cursor:pointer;padding:4px 0}
 .steps{margin:6px 0 0;padding-left:1.3em;font-size:.88rem;line-height:1.7}
 .steps a{color:#2563eb}
 .ok{color:#15803d}
@@ -110,8 +111,8 @@ textarea.inp{resize:none}
   </header>
 
   <div class="keynote" id="keyNote" hidden>
-    <p>AI를 쓰려면 <b>Gemini API 키</b>를 한 번 넣어 주세요. 무료로 받을 수 있어요.</p>
-    <button type="button" id="keyNoteBtn">키 넣기</button>
+    <p>AI 서버를 준비하고 있어요. 그동안은 ⚙ 설정에서 내 Gemini API 키를 넣으면 쓸 수 있어요.</p>
+    <button type="button" id="keyNoteBtn">설정</button>
   </div>
 
   <section class="card">
@@ -165,7 +166,9 @@ textarea.inp{resize:none}
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
-const MODEL_DEFAULT = "gemini-2.5-flash";
+// AI 중계 서버 주소 (Cloudflare Worker). 여기로 보내면 서버에 숨겨 둔 키로 답을 받아 오므로, 쓰는 사람은 키가 필요 없다.
+const PROXY_URL = "";
+const API = "https://generativelanguage.googleapis.com/v1beta";
 const SYSTEM = "당신은 20년 경력의 세계적인 건강식단 연구가이자 식품영양학 박사이며, 미슐랭급 셰프입니다. 모든 답변은 한국어로, 전문가의 입장에서 친절하고 상세하게 제공해야 합니다. 질병이 있는 사람에게는 주의할 점도 함께 알려 주세요.";
 const CAUTION = "※ 일반적인 건강 정보예요. 질환이 있거나 약을 드시는 중이면 의사·영양사와 먼저 상의하세요.";
 
@@ -174,7 +177,13 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
 };
-const settings = () => store.get("health.settings", { key: "", model: MODEL_DEFAULT, region: "전라남도 목포시" });
+const settings = () => {
+  const s = store.get("health.settings", { key: "", model: "", region: "전라남도 목포시" });
+  if (s.model === "gemini-2.5-flash") s.model = "";   // 예전 기본값(없어진 모델)은 자동 선택으로
+  return s;
+};
+/** 키를 넣었거나 중계 서버가 있으면 AI를 쓸 수 있다 */
+const aiReady = () => !!(settings().key || PROXY_URL);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
 function toast(t) {
   document.querySelector(".toast")?.remove();
@@ -190,35 +199,63 @@ const nextMeal = () => { const h = new Date().getHours(); return h >= 8 && h < 1
 class AppError extends Error {}
 async function gemini(prompt, { image = null, search = true } = {}) {
   const s = settings();
-  if (!s.key) throw new AppError("nokey");
+  if (s.key) return direct(s, prompt, image, search);   // 설정에 자기 키를 넣었으면 그 키로 바로
+  if (!PROXY_URL) throw new AppError("AI 서버가 아직 연결되지 않았어요. 관리자에게 알려 주세요.");
+  let res;
+  try {
+    res = await fetch(PROXY_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt, image, search }) });
+  } catch (e) { throw new AppError("AI 서버에 연결할 수 없어요. 인터넷 연결을 확인해 주세요."); }
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok || !j.text) throw new AppError(j.error || `AI 서버 요청이 실패했어요 (${res.status}).`);
+  return { text: j.text, sources: j.sources || [] };
+}
+let autoModel = "";
+/** 지금 쓸 수 있는 Flash 모델 중 가장 새 것을 고른다 (구글이 옛 모델을 없애도 저절로 따라간다) */
+async function pickModel(key) {
+  try {
+    const j = await (await fetch(`${API}/models?pageSize=200`, { headers: { "x-goog-api-key": key } })).json();
+    const names = (j.models || []).filter(m => (m.supportedGenerationMethods || []).includes("generateContent")).map(m => m.name.replace(/^models\//, ""));
+    if (names.includes("gemini-flash-latest")) return "gemini-flash-latest";
+    const ver = n => parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
+    const flash = names.filter(n => /^gemini-[\d.]+-flash(-\d+)?$/.test(n)).sort((a, b) => ver(b) - ver(a) || a.length - b.length);
+    if (flash.length) return flash[0];
+  } catch (e) {}
+  return "gemini-flash-latest";
+}
+async function direct(s, prompt, image, search) {
   const parts = [{ text: prompt }];
   if (image) parts.push({ inlineData: { mimeType: image.type, data: image.data } });
   const body = { systemInstruction: { parts: [{ text: SYSTEM }] }, contents: [{ role: "user", parts }] };
   if (search) body.tools = [{ google_search: {} }];   // 실시간 웹 검색
-  let res;
-  try {
-    res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(s.model || MODEL_DEFAULT)}:generateContent`, {
-      method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": s.key }, body: JSON.stringify(body),
-    });
-  } catch (e) { throw new AppError("인터넷에 연결되어 있는지 확인해 주세요."); }
-  if (!res.ok) {
-    const detail = await res.text().catch(() => "");
-    if (res.status === 400 && /API key|API_KEY/i.test(detail)) throw new AppError("API 키가 맞지 않아요. ⚙ 설정에서 키를 확인해 주세요.");
-    if (res.status === 403) throw new AppError("이 API 키로는 쓸 수 없어요. ⚙ 설정에서 키를 확인해 주세요.");
-    if (res.status === 404) throw new AppError(`AI 모델 '${s.model}'을 찾을 수 없어요. ⚙ 설정에서 모델 이름을 ${MODEL_DEFAULT}로 바꿔 보세요.`);
-    if (res.status === 429) throw new AppError("무료 사용량을 잠시 넘었어요. 1~2분 뒤에 다시 해 주세요.");
-    if (res.status >= 500) throw new AppError("AI 서버가 잠시 바빠요. 잠시 뒤에 다시 해 주세요.");
-    throw new AppError(`요청이 실패했어요 (${res.status}).`);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const model = s.model || autoModel || (autoModel = await pickModel(s.key));
+    let res;
+    try {
+      res = await fetch(`${API}/models/${encodeURIComponent(model)}:generateContent`, {
+        method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": s.key }, body: JSON.stringify(body),
+      });
+    } catch (e) { throw new AppError("인터넷에 연결되어 있는지 확인해 주세요."); }
+    if (res.status === 404 && !s.model && attempt === 0) { autoModel = ""; continue; }   // 모델이 없어졌으면 다시 고른다
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      if (res.status === 400 && /API key|API_KEY/i.test(detail)) throw new AppError("API 키가 맞지 않아요. ⚙ 설정에서 키를 확인해 주세요.");
+      if (res.status === 403) throw new AppError("이 API 키로는 쓸 수 없어요. ⚙ 설정에서 키를 확인해 주세요.");
+      if (res.status === 404) throw new AppError(`AI 모델 '${model}'을 찾을 수 없어요. ⚙ 설정의 모델 칸을 비워 두면 자동으로 골라요.`);
+      if (res.status === 429) throw new AppError("무료 사용량을 잠시 넘었어요. 1~2분 뒤에 다시 해 주세요.");
+      if (res.status >= 500) throw new AppError("AI 서버가 잠시 바빠요. 잠시 뒤에 다시 해 주세요.");
+      throw new AppError(`요청이 실패했어요 (${res.status}).`);
+    }
+    const j = await res.json();
+    const c = j.candidates?.[0];
+    const text = (c?.content?.parts || []).map(p => p.text || "").join("").trim();
+    if (!text) throw new AppError(c?.finishReason === "SAFETY" ? "이 질문에는 답할 수 없다고 해요. 다르게 물어봐 주세요." : "AI가 답을 주지 않았어요. 다시 해 주세요.");
+    const seen = new Set(), sources = [];
+    for (const g of c?.groundingMetadata?.groundingChunks || []) {
+      if (g.web?.uri && !seen.has(g.web.uri)) { seen.add(g.web.uri); sources.push({ uri: g.web.uri, title: g.web.title || g.web.uri }); }
+    }
+    return { text, sources: sources.slice(0, 6) };
   }
-  const j = await res.json();
-  const c = j.candidates?.[0];
-  const text = (c?.content?.parts || []).map(p => p.text || "").join("").trim();
-  if (!text) throw new AppError(c?.finishReason === "SAFETY" ? "이 질문에는 답할 수 없다고 해요. 다르게 물어봐 주세요." : "AI가 답을 주지 않았어요. 다시 해 주세요.");
-  const seen = new Set(), sources = [];
-  for (const g of c?.groundingMetadata?.groundingChunks || []) {
-    if (g.web?.uri && !seen.has(g.web.uri)) { seen.add(g.web.uri); sources.push({ uri: g.web.uri, title: g.web.title || g.web.uri }); }
-  }
-  return { text, sources: sources.slice(0, 6) };
+  throw new AppError("쓸 수 있는 AI 모델을 찾지 못했어요.");
 }
 /** 답 안의 JSON을 꺼낸다 (```json … ``` 이나 맨 앞 { 부터 맨 뒤 } 까지) */
 function pickJson(text) {
@@ -320,7 +357,7 @@ $("#mShare").onclick = async () => {
 /* ---------- 공통 실행 틀: 로딩 → AI → 결과 → 기록 ---------- */
 async function run(label, msg, task) {
   if (busy) return;
-  if (!settings().key) { openSettings(); toast("먼저 Gemini API 키를 넣어 주세요"); return; }
+  if (!aiReady()) { openSettings(); toast("AI 서버가 아직 연결되지 않았어요"); return; }
   busy = true; document.querySelectorAll(".btn").forEach(b => b.disabled = true);
   loading(msg);
   try {
@@ -364,7 +401,7 @@ function doSearch() {
 }
 $("#btnSearch").onclick = doSearch;
 $("#search").addEventListener("keydown", e => { if (e.key === "Enter") doSearch(); });
-$("#btnPhoto").onclick = () => { if (!settings().key) { openSettings(); toast("먼저 Gemini API 키를 넣어 주세요"); return; } $("#photo").click(); };
+$("#btnPhoto").onclick = () => { if (!aiReady()) { openSettings(); toast("AI 서버가 아직 연결되지 않았어요"); return; } $("#photo").click(); };
 $("#photo").addEventListener("change", async e => {
   const file = e.target.files[0]; e.target.value = "";
   if (!file) return;
@@ -466,38 +503,34 @@ $("#mBody").addEventListener("click", e => {
   if (e.target.closest(".del")) { store.set(HKEY, list.filter(x => x.id !== it.id)); showHistory(); toast("삭제했어요"); }
 });
 
-/* ---------- 설정: API 키 · 모델 · 기본 지역 ---------- */
+/* ---------- 설정: 기본 지역 · (고급) 내 API 키 · 모델 ---------- */
 function openSettings() {
   const s = settings();
   openModal("⚙ 설정", `
-    <div class="field"><label for="sKey">Gemini API 키</label>
-      <div class="row"><input class="inp" id="sKey" type="password" autocomplete="off" spellcheck="false" placeholder="AIza…로 시작하는 키" value="${esc(s.key)}">
-      <button type="button" class="btn b-gray icon-btn" id="sShow" aria-label="키 보기">👁</button></div>
-      <small>키는 이 휴대폰에만 저장되고, 구글 AI에 질문할 때만 쓰여요.</small>
-      <ol class="steps">
-        <li><a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">구글 AI 스튜디오 (aistudio.google.com/apikey)</a>를 열고 구글 계정으로 로그인해요.</li>
-        <li><b>API 키 만들기(Create API key)</b>를 누르고 만들어진 키를 <b>복사</b>해요.</li>
-        <li>위 칸에 붙여 넣고 <b>저장</b>을 누르면 끝이에요. 무료 사용량 안에서는 돈이 들지 않아요.</li>
-      </ol></div>
     <div class="field"><label for="sRegion">맛집 검색 기본 지역</label>
       <input class="inp" id="sRegion" value="${esc(s.region)}" placeholder="예: 전라남도 목포시">
       <small>위치 권한을 허용하지 않았을 때 이 지역을 기준으로 찾아요.</small></div>
-    <div class="field"><label for="sModel">AI 모델</label>
-      <input class="inp" id="sModel" value="${esc(s.model)}" autocomplete="off" spellcheck="false">
-      <small>보통은 바꾸지 않아도 돼요. 기본값: ${MODEL_DEFAULT}</small></div>
+    <details class="field" ${s.key || !PROXY_URL ? "open" : ""}><summary><b>고급: 내 API 키 직접 쓰기 (선택)</b></summary>
+      <small>${PROXY_URL ? "키 없이도 AI를 쓸 수 있어요. 내 키를 넣으면 그 키로 바로 질문해요." : "AI 서버를 준비하는 동안에는 여기에 내 키를 넣으면 쓸 수 있어요."}</small>
+      <div class="row" style="margin-top:6px"><input class="inp" id="sKey" type="password" autocomplete="off" spellcheck="false" placeholder="AIza…로 시작하는 키 (비워 두면 AI 서버 사용)" value="${esc(s.key)}">
+      <button type="button" class="btn b-gray icon-btn" id="sShow" aria-label="키 보기">👁</button></div>
+      <small>키는 이 휴대폰에만 저장돼요. 키 받기: <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a></small>
+      <label for="sModel" style="margin-top:8px">AI 모델</label>
+      <input class="inp" id="sModel" value="${esc(s.model)}" autocomplete="off" spellcheck="false" placeholder="비워 두면 자동으로 골라요">
+    </details>
     <p id="sMsg" role="status"></p>
     <div class="grid2"><button type="button" class="btn b-indigo" id="sSave">저장</button><button type="button" class="btn b-teal" id="sTest">연결 확인</button></div>
     <div class="grid2"><button type="button" class="btn b-gray" id="sClearHist">기록 모두 지우기</button><button type="button" class="btn b-gray" id="sClearKey">키 지우기</button></div>`, { caution: false, tools: false });
   $("#mTitle").textContent = "⚙ 설정";
   const save = () => {
-    const v = { key: $("#sKey").value.trim(), model: $("#sModel").value.trim() || MODEL_DEFAULT, region: $("#sRegion").value.trim() || "전라남도 목포시" };
+    const v = { key: $("#sKey").value.trim(), model: $("#sModel").value.trim(), region: $("#sRegion").value.trim() || "전라남도 목포시" };
     store.set("health.settings", v); refreshKeyNote(); return v;
   };
   $("#sShow").onclick = () => { const i = $("#sKey"); i.type = i.type === "password" ? "text" : "password"; };
   $("#sSave").onclick = () => { save(); toast("저장했어요"); closeModal(); };
   $("#sTest").onclick = async () => {
     const v = save(), msg = $("#sMsg");
-    if (!v.key) { msg.className = "err"; msg.textContent = "키를 먼저 넣어 주세요."; return; }
+    if (!v.key && !PROXY_URL) { msg.className = "err"; msg.textContent = "AI 서버가 아직 없어요. 내 키를 넣고 확인해 주세요."; return; }
     msg.className = ""; msg.textContent = "확인하는 중…";
     try { await gemini("'연결 성공'이라고만 답하세요.", { search: false }); msg.className = "ok"; msg.textContent = "✅ 연결됐어요! 이제 모든 기능을 쓸 수 있어요."; }
     catch (e) { msg.className = "err"; msg.textContent = e instanceof AppError ? e.message : "확인하지 못했어요."; }
@@ -511,7 +544,7 @@ function openSettings() {
 }
 $("#btnSettings").onclick = openSettings;
 $("#keyNoteBtn").onclick = openSettings;
-const refreshKeyNote = () => { $("#keyNote").hidden = !!settings().key; };
+const refreshKeyNote = () => { $("#keyNote").hidden = aiReady(); };
 
 /* ---------- 시작 ---------- */
 $("#greet").textContent = `🌿 지금은 ${season()}, 다음 식사는 ${nextMeal()}이에요.`;
