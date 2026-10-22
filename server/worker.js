@@ -11,7 +11,7 @@ const MAX_BODY = 6 * 1024 * 1024;   // 사진 포함 최대 6MB
 const SYSTEM = "당신은 20년 경력의 세계적인 건강식단 연구가이자 식품영양학 박사이며, 미슐랭급 셰프입니다. 모든 답변은 한국어로, 전문가의 입장에서 친절하고 상세하게 제공해야 합니다. 질병이 있는 사람에게는 주의할 점도 함께 알려 주세요.";
 const API = "https://generativelanguage.googleapis.com/v1beta";
 
-let model = "";            // 지금 쓰는 AI 모델 (처음 요청 때 자동으로 고른다)
+let model = "";            // 지난번에 잘 된 AI 모델
 const usage = new Map();   // 인터넷 주소별 사용 횟수 (서버가 다시 켜지면 초기화)
 
 export default {
@@ -70,46 +70,75 @@ function checkLimit(ip) {
 }
 
 async function ask(key, payload) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (!model) model = await pickModel(key);
+  // 구글이 "사용량 초과(429)"라고 하면 검색 없이 다시 묻고, 그래도 안 되면 다른 모델로 바꿔서 묻는다
+  const models = await pickModels(key);
+  const tries = [];
+  for (const m of models.slice(0, 3)) {
+    if (payload.tools) tries.push([m, payload]);
+    tries.push([m, { ...payload, tools: undefined }]);
+  }
+  let last = null;
+  for (const [m, p] of tries.slice(0, 5)) {
     let res;
     try {
-      res = await fetch(`${API}/models/${model}:generateContent`, {
-        method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key }, body: JSON.stringify(payload),
+      res = await fetch(`${API}/models/${m}:generateContent`, {
+        method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key }, body: JSON.stringify(p),
       });
     } catch (e) { return { status: 502, body: { error: "AI 서버에 연결하지 못했어요. 잠시 뒤에 다시 해 주세요." } }; }
-    if (res.status === 404 && attempt === 0) { model = ""; continue; }   // 모델이 없어졌으면 다시 고른다
-    if (!res.ok) {
-      const msg = res.status === 429 ? "지금 사용하는 사람이 많아요. 1~2분 뒤에 다시 해 주세요."
-        : res.status === 400 || res.status === 403 ? "AI 서버의 API 키를 확인해야 해요. 관리자에게 알려 주세요."
-        : "AI 서버가 잠시 바빠요. 잠시 뒤에 다시 해 주세요.";
-      return { status: res.status, body: { error: msg } };
+    if (res.status === 429 || res.status === 404 || res.status === 503) {
+      last = { status: res.status, detail: await googleMessage(res), model: m };
+      continue;
     }
+    if (!res.ok) {
+      const detail = await googleMessage(res);
+      const msg = res.status === 400 || res.status === 403 ? "AI 서버의 API 키를 확인해야 해요. 관리자에게 알려 주세요."
+        : "AI 서버가 잠시 바빠요. 잠시 뒤에 다시 해 주세요.";
+      return { status: res.status, body: { error: msg, detail } };
+    }
+    model = m;   // 잘 된 모델을 기억해 두고 다음에 먼저 쓴다
     const j = await res.json();
     const c = j.candidates?.[0];
-    const text = (c?.content?.parts || []).map(p => p.text || "").join("").trim();
+    const text = (c?.content?.parts || []).map(x => x.text || "").join("").trim();
     if (!text) return { status: 422, body: { error: c?.finishReason === "SAFETY" ? "이 질문에는 답할 수 없다고 해요. 다르게 물어봐 주세요." : "AI가 답을 주지 않았어요. 다시 해 주세요." } };
     const seen = new Set(), sources = [];
     for (const g of c?.groundingMetadata?.groundingChunks || []) {
       if (g.web?.uri && !seen.has(g.web.uri)) { seen.add(g.web.uri); sources.push({ uri: g.web.uri, title: g.web.title || g.web.uri }); }
     }
-    return { status: 200, body: { text, sources: sources.slice(0, 6), model } };
+    return { status: 200, body: { text, sources: sources.slice(0, 6), model: m } };
   }
-  return { status: 404, body: { error: "쓸 수 있는 AI 모델을 찾지 못했어요. 관리자에게 알려 주세요." } };
+  const msg = last?.status === 429 ? "오늘 무료 사용량을 다 썼거나 사용하는 사람이 많아요. 잠시 뒤에 다시 해 주세요."
+    : "쓸 수 있는 AI 모델을 찾지 못했어요. 관리자에게 알려 주세요.";
+  return { status: last?.status || 404, body: { error: msg, detail: last?.detail, model: last?.model } };
 }
 
-/** 지금 쓸 수 있는 Flash 모델 중 가장 새 것을 고른다 (구글이 옛 모델을 없애도 저절로 따라간다) */
-async function pickModel(key) {
-  try {
-    const res = await fetch(`${API}/models?pageSize=200`, { headers: { "x-goog-api-key": key } });
-    const j = await res.json();
-    const names = (j.models || [])
-      .filter(m => (m.supportedGenerationMethods || []).includes("generateContent"))
-      .map(m => m.name.replace(/^models\//, ""));
-    if (names.includes("gemini-flash-latest")) return "gemini-flash-latest";
+/** 구글이 보낸 오류 설명 (원인 확인용) */
+async function googleMessage(res) {
+  try { const j = await res.json(); return String(j.error?.message || "").slice(0, 300); } catch (e) { return ""; }
+}
+
+/** 쓸 수 있는 Flash 모델을 좋은 순서대로 고른다 (구글이 옛 모델을 없애도 저절로 따라간다) */
+let modelList = null;
+async function pickModels(key) {
+  if (!modelList) {
+    let names = [];
+    try {
+      const res = await fetch(`${API}/models?pageSize=200`, { headers: { "x-goog-api-key": key } });
+      const j = await res.json();
+      names = (j.models || [])
+        .filter(m => (m.supportedGenerationMethods || []).includes("generateContent"))
+        .map(m => m.name.replace(/^models\//, ""));
+    } catch (e) {}
     const ver = n => parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
-    const flash = names.filter(n => /^gemini-[\d.]+-flash(-\d+)?$/.test(n)).sort((a, b) => ver(b) - ver(a) || a.length - b.length);
-    if (flash.length) return flash[0];
-  } catch (e) {}
-  return "gemini-flash-latest";
+    const byVer = re => names.filter(n => re.test(n)).sort((a, b) => ver(b) - ver(a) || a.length - b.length);
+    const list = [];
+    if (names.includes("gemini-flash-latest")) list.push("gemini-flash-latest");
+    list.push(...byVer(/^gemini-[\d.]+-flash(-\d+)?$/));
+    if (names.includes("gemini-flash-lite-latest")) list.push("gemini-flash-lite-latest");
+    list.push(...byVer(/^gemini-[\d.]+-flash-lite(-\d+)?$/));
+    modelList = list.length ? [...new Set(list)] : ["gemini-flash-latest"];
+  }
+  // 지난번에 잘 된 모델을 맨 앞에, 그 다음은 서로 다른 모델이 섞이게
+  const rest = modelList.filter(m => m !== model);
+  const lite = rest.filter(m => m.includes("lite")), full = rest.filter(m => !m.includes("lite"));
+  return [...(model ? [model] : []), full[0], lite[0], ...full.slice(1), ...lite.slice(1)].filter(Boolean);
 }

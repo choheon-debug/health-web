@@ -1,6 +1,6 @@
 // 앱 파일을 휴대폰에 저장해 두어 인터넷이 잠깐 끊겨도 열리게 한다.
 // 앱을 고칠 때마다 VERSION을 올려야 새 버전이 퍼진다.
-const VERSION = "health-web-4";
+const VERSION = "health-web-5";
 const ASSETS = ["./", "./index.html", "./manifest.webmanifest", 
   "./icons/icon-192.png", "./icons/icon-512.png", "./icons/apple-touch-icon.png"];
 

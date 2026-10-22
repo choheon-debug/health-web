@@ -84,7 +84,7 @@ textarea.inp{resize:none}
 @media (prefers-reduced-motion:reduce){.spinner{animation-duration:3s}}
 .loading{text-align:center;padding:36px 0;color:var(--muted)}
 .loading p{margin-top:14px}
-.err{color:var(--danger)}
+.err{color:var(--danger);white-space:pre-line;word-break:break-word}
 .hist{border-bottom:1px solid #e5e7eb;padding:10px 0;display:flex;gap:10px;align-items:center}
 .hist button.open{flex:1;min-width:0;text-align:left;border:0;background:none;padding:0}
 .hist .q{font-weight:700;color:#7e22ce;display:block;overflow-wrap:anywhere}
@@ -207,7 +207,7 @@ async function gemini(prompt, { image = null, search = true } = {}) {
   } catch (e) { throw new AppError("AI 서버에 연결할 수 없어요. 인터넷 연결을 확인해 주세요."); }
   const j = await res.json().catch(() => null);
   if (!j) throw new AppError("AI 서버가 아직 준비되지 않았어요. 잠시 뒤에 다시 해 주세요.");   // 서버 코드가 아직 안 들어갔을 때
-  if (!res.ok || !j.text) throw new AppError(j.error || `AI 서버 요청이 실패했어요 (${res.status}).`);
+  if (!res.ok || !j.text) throw new AppError((j.error || `AI 서버 요청이 실패했어요 (${res.status}).`) + (j.detail ? `\n(원인: ${j.detail})` : ""));
   return { text: j.text, sources: j.sources || [] };
 }
 let autoModel = "";
