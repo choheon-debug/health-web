@@ -1,0 +1,16 @@
+{
+  "name": "건강 레시피",
+  "short_name": "건강 레시피",
+  "description": "AI가 실시간 웹 검색으로 건강 식단·음료·운동·레시피를 추천해 주는 앱",
+  "lang": "ko",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#F3F4F6",
+  "theme_color": "#F3F4F6",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
