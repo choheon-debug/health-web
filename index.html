@@ -167,7 +167,7 @@ textarea.inp{resize:none}
 "use strict";
 const $ = s => document.querySelector(s);
 // AI 중계 서버 주소 (Cloudflare Worker). 여기로 보내면 서버에 숨겨 둔 키로 답을 받아 오므로, 쓰는 사람은 키가 필요 없다.
-const PROXY_URL = "";
+const PROXY_URL = "https://health-ai.choheon.workers.dev/";
 const API = "https://generativelanguage.googleapis.com/v1beta";
 const SYSTEM = "당신은 20년 경력의 세계적인 건강식단 연구가이자 식품영양학 박사이며, 미슐랭급 셰프입니다. 모든 답변은 한국어로, 전문가의 입장에서 친절하고 상세하게 제공해야 합니다. 질병이 있는 사람에게는 주의할 점도 함께 알려 주세요.";
 const CAUTION = "※ 일반적인 건강 정보예요. 질환이 있거나 약을 드시는 중이면 의사·영양사와 먼저 상의하세요.";
@@ -205,7 +205,8 @@ async function gemini(prompt, { image = null, search = true } = {}) {
   try {
     res = await fetch(PROXY_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt, image, search }) });
   } catch (e) { throw new AppError("AI 서버에 연결할 수 없어요. 인터넷 연결을 확인해 주세요."); }
-  const j = await res.json().catch(() => ({}));
+  const j = await res.json().catch(() => null);
+  if (!j) throw new AppError("AI 서버가 아직 준비되지 않았어요. 잠시 뒤에 다시 해 주세요.");   // 서버 코드가 아직 안 들어갔을 때
   if (!res.ok || !j.text) throw new AppError(j.error || `AI 서버 요청이 실패했어요 (${res.status}).`);
   return { text: j.text, sources: j.sources || [] };
 }
