@@ -84,6 +84,7 @@ textarea.inp{resize:none}
 @media (prefers-reduced-motion:reduce){.spinner{animation-duration:3s}}
 .loading{text-align:center;padding:36px 0;color:var(--muted)}
 .loading p{margin-top:14px}
+.loading .wait{margin-top:6px;font-size:.85rem;opacity:.8;min-height:1.2em}
 .err{color:var(--danger);white-space:pre-line;word-break:break-word}
 .hist{border-bottom:1px solid #e5e7eb;padding:10px 0;display:flex;gap:10px;align-items:center}
 .hist button.open{flex:1;min-width:0;text-align:left;border:0;background:none;padding:0}
@@ -340,7 +341,18 @@ function openModal(title, html, { sources = [], food = null, caution = true, too
   $("#modal").hidden = false;
 }
 const closeModal = () => { $("#modal").hidden = true; };
-const loading = msg => openModal("정보 검색 중", `<div class="loading"><div class="spinner"></div><p>${esc(msg)}</p></div>`, { caution: false, tools: false });
+let loadTimer = 0;
+/** 기다리는 동안 몇 초 지났는지와 단계별 안내를 보여 준다 (멈춘 게 아니라는 걸 알 수 있게) */
+function loading(msg) {
+  openModal("정보 검색 중", `<div class="loading"><div class="spinner"></div><p>${esc(msg)}</p><p class="wait" id="waitText"></p></div>`, { caution: false, tools: false });
+  const t0 = Date.now();
+  clearInterval(loadTimer);
+  loadTimer = setInterval(() => {
+    const el = $("#waitText"), sec = Math.round((Date.now() - t0) / 1000);
+    if (!el) { clearInterval(loadTimer); return; }
+    el.textContent = `${sec}초 ${sec < 8 ? "· 웹에서 자료를 찾고 있어요" : sec < 20 ? "· 찾은 자료로 답을 쓰고 있어요" : "· 거의 다 됐어요, 조금만 기다려 주세요"}`;
+  }, 1000);
+}
 $("#mClose").onclick = closeModal;
 $("#modal").addEventListener("click", e => { if (e.target.id === "modal" && !busy) closeModal(); });
 document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("#modal").hidden && !busy) closeModal(); });
@@ -368,7 +380,7 @@ async function run(label, msg, task) {
   } catch (e) {
     console.error(e);
     openModal("앗, 잘 안 됐어요", `<p class="err">${esc(e instanceof AppError ? e.message : "알 수 없는 문제가 생겼어요. 다시 해 주세요.")}</p>`, { caution: false, tools: false });
-  } finally { busy = false; document.querySelectorAll(".btn").forEach(b => b.disabled = false); }
+  } finally { clearInterval(loadTimer); busy = false; document.querySelectorAll(".btn").forEach(b => b.disabled = false); }
 }
 const FOOD_JSON = `반드시 아래 JSON 하나만 \`\`\`json 블록으로 답하세요.
 {"name":"메뉴 이름","description":"추천 이유와 간단한 설명","nutrients":["영양소와 효과"],"recipes":[{"title":"레시피 제목","steps":["조리 단계"]}],"caution":"이 질환이 있는 사람이 주의할 점 (없으면 빈 문자열)"}`;

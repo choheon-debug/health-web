@@ -29,7 +29,9 @@ export default {
 
     if (req.method === "OPTIONS") return new Response(null, { headers: cors });
     // 브라우저로 서버 주소를 열면 상태를 보여 준다 (설정이 잘 됐는지 확인용)
-    if (req.method === "GET") return reply({ ok: true, key: env.GEMINI_KEY ? "있음" : "없음 (GEMINI_KEY를 넣어 주세요)", model: model || "첫 질문 때 자동으로 골라요" });
+    if (req.method === "GET") return reply({ ok: true, key: env.GEMINI_KEY ? "있음" : "없음 (GEMINI_KEY를 넣어 주세요)", model: model || "첫 질문 때 자동으로 골라요",
+      last: last.at ? `${(last.ms / 1000).toFixed(1)}초 걸림 · ${last.model} · 웹 검색 ${last.search ? "함" : "안 함"}` : "아직 없음",
+      search: Date.now() > searchOffUntil ? "켜짐" : "잠시 꺼짐 (구글 무료 사용량 초과)" });
     if (req.method !== "POST") return reply({ error: "지원하지 않는 요청이에요." }, 405);
     if (!allowed) return reply({ error: "건강 레시피 앱에서만 쓸 수 있어요." }, 403);
     if (!env.GEMINI_KEY) return reply({ error: "AI 서버에 API 키가 아직 없어요. 관리자에게 알려 주세요." }, 500);
@@ -69,24 +71,42 @@ function checkLimit(ip) {
   return "";
 }
 
+// 빠르게 답하도록: 구글이 검색을 거절한 적이 있으면 한동안 검색 없이 묻고,
+// 모델이 "생각"하는 시간을 줄인다 (모델마다 받는 설정이 달라서, 안 받으면 기억해 두고 빼고 보낸다)
+let searchOffUntil = 0;
+const noThink = new Set();
+const thinkCfg = m => noThink.has(m) ? null : /2\.5/.test(m) ? { thinkingBudget: 0 } : { thinkingLevel: "low" };
+const last = { ms: 0, model: "", search: false, at: "" };   // 마지막 질문이 얼마나 걸렸는지 (확인용)
+
 async function ask(key, payload) {
   // 구글이 "사용량 초과(429)"라고 하면 검색 없이 다시 묻고, 그래도 안 되면 다른 모델로 바꿔서 묻는다
+  const t0 = Date.now();
   const models = await pickModels(key);
+  const search = payload.tools && Date.now() > searchOffUntil;
   const tries = [];
   for (const m of models.slice(0, 3)) {
-    if (payload.tools) tries.push([m, payload]);
-    tries.push([m, { ...payload, tools: undefined }]);
+    if (search) tries.push([m, true]);
+    tries.push([m, false]);
   }
-  let last = null;
-  for (const [m, p] of tries.slice(0, 5)) {
+  let fail = null;
+  for (let k = 0; k < tries.length && k < 6; k++) {
+    const [m, useSearch] = tries[k];
+    const cfg = thinkCfg(m);
+    const p = { ...payload, tools: useSearch ? payload.tools : undefined, generationConfig: cfg ? { thinkingConfig: cfg } : undefined };
     let res;
     try {
       res = await fetch(`${API}/models/${m}:generateContent`, {
         method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key }, body: JSON.stringify(p),
       });
     } catch (e) { return { status: 502, body: { error: "AI 서버에 연결하지 못했어요. 잠시 뒤에 다시 해 주세요." } }; }
+    if (res.status === 400 && cfg) {
+      const detail = await googleMessage(res);
+      if (/think/i.test(detail)) { noThink.add(m); tries.splice(k + 1, 0, tries[k]); continue; }   // 생각 설정을 빼고 다시
+      return { status: 400, body: { error: "AI 서버의 API 키를 확인해야 해요. 관리자에게 알려 주세요.", detail } };
+    }
     if (res.status === 429 || res.status === 404 || res.status === 503) {
-      last = { status: res.status, detail: await googleMessage(res), model: m };
+      if (res.status === 429 && useSearch) searchOffUntil = Date.now() + 30 * 60000;   // 30분 동안은 검색 없이
+      fail = { status: res.status, detail: await googleMessage(res), model: m };
       continue;
     }
     if (!res.ok) {
@@ -98,17 +118,18 @@ async function ask(key, payload) {
     model = m;   // 잘 된 모델을 기억해 두고 다음에 먼저 쓴다
     const j = await res.json();
     const c = j.candidates?.[0];
-    const text = (c?.content?.parts || []).map(x => x.text || "").join("").trim();
+    const text = (c?.content?.parts || []).filter(x => !x.thought).map(x => x.text || "").join("").trim();
+    Object.assign(last, { ms: Date.now() - t0, model: m, search: useSearch, at: new Date().toISOString() });
     if (!text) return { status: 422, body: { error: c?.finishReason === "SAFETY" ? "이 질문에는 답할 수 없다고 해요. 다르게 물어봐 주세요." : "AI가 답을 주지 않았어요. 다시 해 주세요." } };
     const seen = new Set(), sources = [];
     for (const g of c?.groundingMetadata?.groundingChunks || []) {
       if (g.web?.uri && !seen.has(g.web.uri)) { seen.add(g.web.uri); sources.push({ uri: g.web.uri, title: g.web.title || g.web.uri }); }
     }
-    return { status: 200, body: { text, sources: sources.slice(0, 6), model: m } };
+    return { status: 200, body: { text, sources: sources.slice(0, 6), model: m, search: useSearch, ms: last.ms } };
   }
-  const msg = last?.status === 429 ? "오늘 무료 사용량을 다 썼거나 사용하는 사람이 많아요. 잠시 뒤에 다시 해 주세요."
+  const msg = fail?.status === 429 ? "오늘 무료 사용량을 다 썼거나 사용하는 사람이 많아요. 잠시 뒤에 다시 해 주세요."
     : "쓸 수 있는 AI 모델을 찾지 못했어요. 관리자에게 알려 주세요.";
-  return { status: last?.status || 404, body: { error: msg, detail: last?.detail, model: last?.model } };
+  return { status: fail?.status || 404, body: { error: msg, detail: fail?.detail, model: fail?.model } };
 }
 
 /** 구글이 보낸 오류 설명 (원인 확인용) */
