@@ -44,7 +44,7 @@ export default {
     const prompt = String(body.prompt || "").slice(0, 4000);
     if (!prompt) return reply({ error: "질문이 비어 있어요." }, 400);
 
-    const parts = [{ text: prompt }];
+    const parts = /** @type {any[]} */ ([{ text: prompt }]);   // 글자 + (있으면) 사진
     const img = body.image;
     if (img && /^image\/(jpeg|png|webp|heic|heif)$/.test(img.type || "") && typeof img.data === "string") {
       parts.push({ inlineData: { mimeType: img.type, data: img.data } });
