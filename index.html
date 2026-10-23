@@ -84,6 +84,7 @@ textarea.inp{resize:none}
 @media (prefers-reduced-motion:reduce){.spinner{animation-duration:3s}}
 .loading{text-align:center;padding:36px 0;color:var(--muted)}
 .loading p{margin-top:14px}
+.writing{color:var(--muted);font-size:.85rem;margin-top:10px}
 .loading .wait{margin-top:6px;font-size:.85rem;opacity:.8;min-height:1.2em}
 .err{color:var(--danger);white-space:pre-line;word-break:break-word}
 .hist{border-bottom:1px solid #e5e7eb;padding:10px 0;display:flex;gap:10px;align-items:center}
@@ -198,18 +199,52 @@ const nextMeal = () => { const h = new Date().getHours(); return h >= 8 && h < 1
 
 /* ---------- Gemini 호출 ---------- */
 class AppError extends Error {}
-async function gemini(prompt, { image = null, search = true } = {}) {
+/** AI에게 묻는다. onText를 주면 답이 오는 대로 조금씩 알려 준다(스트리밍). */
+async function gemini(prompt, { image = null, search = true, onText = null } = {}) {
   const s = settings();
-  if (s.key) return direct(s, prompt, image, search);   // 설정에 자기 키를 넣었으면 그 키로 바로
+  if (s.key) return direct(s, prompt, image, search, onText);   // 설정에 자기 키를 넣었으면 그 키로 바로
   if (!PROXY_URL) throw new AppError("AI 서버가 아직 연결되지 않았어요. 관리자에게 알려 주세요.");
   let res;
   try {
-    res = await fetch(PROXY_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt, image, search }) });
+    res = await fetch(PROXY_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt, image, search, stream: true }) });
   } catch (e) { throw new AppError("AI 서버에 연결할 수 없어요. 인터넷 연결을 확인해 주세요."); }
+  if (res.ok && /event-stream/.test(res.headers.get("Content-Type") || "")) return readStream(res, onText);
   const j = await res.json().catch(() => null);
   if (!j) throw new AppError("AI 서버가 아직 준비되지 않았어요. 잠시 뒤에 다시 해 주세요.");   // 서버 코드가 아직 안 들어갔을 때
   if (!res.ok || !j.text) throw new AppError((j.error || `AI 서버 요청이 실패했어요 (${res.status}).`) + (j.detail ? `\n(원인: ${j.detail})` : ""));
+  onText?.(j.text);
   return { text: j.text, sources: j.sources || [] };
+}
+/** 구글이 조금씩 보내는 답(SSE)을 모아서, 올 때마다 onText로 지금까지의 글을 알려 준다 */
+async function readStream(res, onText) {
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let buf = "", text = "", finish = "";
+  const seen = new Set(), sources = [];
+  const take = line => {
+    if (!line.startsWith("data:")) return;
+    let j; try { j = JSON.parse(line.slice(5)); } catch (e) { return; }
+    const c = j.candidates?.[0];
+    if (!c) return;
+    const add = (c.content?.parts || []).filter(x => !x.thought).map(x => x.text || "").join("");
+    if (add) { text += add; onText?.(text); }
+    if (c.finishReason) finish = c.finishReason;
+    for (const g of c.groundingMetadata?.groundingChunks || []) {
+      if (g.web?.uri && !seen.has(g.web.uri)) { seen.add(g.web.uri); sources.push({ uri: g.web.uri, title: g.web.title || g.web.uri }); }
+    }
+  };
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split(/\r?\n/); buf = lines.pop();
+      lines.forEach(take);
+    }
+    take(buf);
+  } catch (e) { if (!text) throw new AppError("답을 받다가 연결이 끊겼어요. 다시 해 주세요."); }
+  text = text.trim();
+  if (!text) throw new AppError(finish === "SAFETY" ? "이 질문에는 답할 수 없다고 해요. 다르게 물어봐 주세요." : "AI가 답을 주지 않았어요. 다시 해 주세요.");
+  return { text, sources: sources.slice(0, 6) };
 }
 let autoModel = "";
 /** 지금 쓸 수 있는 Flash 모델 중 가장 새 것을 고른다 (구글이 옛 모델을 없애도 저절로 따라간다) */
@@ -224,7 +259,7 @@ async function pickModel(key) {
   } catch (e) {}
   return "gemini-flash-latest";
 }
-async function direct(s, prompt, image, search) {
+async function direct(s, prompt, image, search, onText) {
   const parts = [{ text: prompt }];
   if (image) parts.push({ inlineData: { mimeType: image.type, data: image.data } });
   const body = { systemInstruction: { parts: [{ text: SYSTEM }] }, contents: [{ role: "user", parts }] };
@@ -233,7 +268,7 @@ async function direct(s, prompt, image, search) {
     const model = s.model || autoModel || (autoModel = await pickModel(s.key));
     let res;
     try {
-      res = await fetch(`${API}/models/${encodeURIComponent(model)}:generateContent`, {
+      res = await fetch(`${API}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
         method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": s.key }, body: JSON.stringify(body),
       });
     } catch (e) { throw new AppError("인터넷에 연결되어 있는지 확인해 주세요."); }
@@ -247,15 +282,7 @@ async function direct(s, prompt, image, search) {
       if (res.status >= 500) throw new AppError("AI 서버가 잠시 바빠요. 잠시 뒤에 다시 해 주세요.");
       throw new AppError(`요청이 실패했어요 (${res.status}).`);
     }
-    const j = await res.json();
-    const c = j.candidates?.[0];
-    const text = (c?.content?.parts || []).map(p => p.text || "").join("").trim();
-    if (!text) throw new AppError(c?.finishReason === "SAFETY" ? "이 질문에는 답할 수 없다고 해요. 다르게 물어봐 주세요." : "AI가 답을 주지 않았어요. 다시 해 주세요.");
-    const seen = new Set(), sources = [];
-    for (const g of c?.groundingMetadata?.groundingChunks || []) {
-      if (g.web?.uri && !seen.has(g.web.uri)) { seen.add(g.web.uri); sources.push({ uri: g.web.uri, title: g.web.title || g.web.uri }); }
-    }
-    return { text, sources: sources.slice(0, 6) };
+    return readStream(res, onText);
   }
   throw new AppError("쓸 수 있는 AI 모델을 찾지 못했어요.");
 }
@@ -275,6 +302,7 @@ function mdToHtml(text) {
     const t = line.trim();
     if (!t) { close(); continue; }
     let m;
+    if ((m = t.match(/^##\s+(.*)/))) { close(); out.push(`<h4 class="${/영양/.test(m[1]) ? "g" : /주의/.test(m[1]) ? "o" : "b"}">${inline(m[1])}</h4>`); continue; }
     if ((m = t.match(/^#{1,6}\s+(.*)/))) { close(); out.push(`<h5>${inline(m[1])}</h5>`); continue; }
     if ((m = t.match(/^[-*•]\s+(.*)/))) { if (list !== "ul") { close(); out.push("<ul>"); list = "ul"; } out.push(`<li>${inline(m[1])}</li>`); continue; }
     if ((m = t.match(/^\d+[.)]\s+(.*)/))) { if (list !== "ol") { close(); out.push("<ol>"); list = "ol"; } out.push(`<li>${inline(m[1])}</li>`); continue; }
@@ -282,17 +310,6 @@ function mdToHtml(text) {
   }
   close();
   return out.join("");
-}
-const stripNo = s => String(s).replace(/^\s*(\d+[.)]|[-*•])\s*/, "");
-function foodHtml(d) {
-  let h = `<p>${esc(d.description || "")}</p>`;
-  if (d.nutrients?.length) h += `<h4 class="g">1. 주요 영양성분</h4><ul>${d.nutrients.map(n => `<li>${esc(stripNo(n))}</li>`).join("")}</ul>`;
-  if (d.recipes?.length) {
-    h += `<h4 class="b">2. 추천 레시피</h4>`;
-    d.recipes.forEach((r, i) => { h += `<h5>${i + 1}. ${esc(r.title || "")}</h5><ol>${(r.steps || []).map(s => `<li>${esc(stripNo(s))}</li>`).join("")}</ol>`; });
-  }
-  if (d.caution) h += `<h4 class="o">3. 주의할 점</h4><p>${esc(d.caution)}</p>`;
-  return h;
 }
 function weeklyHtml(d) {
   const days = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"];
@@ -341,16 +358,16 @@ function openModal(title, html, { sources = [], food = null, caution = true, too
   $("#modal").hidden = false;
 }
 const closeModal = () => { $("#modal").hidden = true; };
-let loadTimer = 0;
+let loadTimer = 0, loadExtra = "";
 /** 기다리는 동안 몇 초 지났는지와 단계별 안내를 보여 준다 (멈춘 게 아니라는 걸 알 수 있게) */
 function loading(msg) {
   openModal("정보 검색 중", `<div class="loading"><div class="spinner"></div><p>${esc(msg)}</p><p class="wait" id="waitText"></p></div>`, { caution: false, tools: false });
   const t0 = Date.now();
-  clearInterval(loadTimer);
+  clearInterval(loadTimer); loadExtra = "";
   loadTimer = setInterval(() => {
     const el = $("#waitText"), sec = Math.round((Date.now() - t0) / 1000);
     if (!el) { clearInterval(loadTimer); return; }
-    el.textContent = `${sec}초 ${sec < 8 ? "· 웹에서 자료를 찾고 있어요" : sec < 20 ? "· 찾은 자료로 답을 쓰고 있어요" : "· 거의 다 됐어요, 조금만 기다려 주세요"}`;
+    el.textContent = loadExtra ? `${sec}초 · ${loadExtra}` : `${sec}초 ${sec < 8 ? "· 웹에서 자료를 찾고 있어요" : sec < 20 ? "· 찾은 자료로 답을 쓰고 있어요" : "· 거의 다 됐어요, 조금만 기다려 주세요"}`;
   }, 1000);
 }
 $("#mClose").onclick = closeModal;
@@ -368,11 +385,21 @@ $("#mShare").onclick = async () => {
 };
 
 /* ---------- 공통 실행 틀: 로딩 → AI → 결과 → 기록 ---------- */
+/** 답이 오는 동안 지금까지 쓴 글을 바로 보여 준다 (너무 자주 그리지 않게 0.2초마다) */
+let liveAt = 0, liveT0 = 0;
+function live(title, html) {
+  const now = Date.now();
+  if (now - liveAt < 200) return;
+  liveAt = now; clearInterval(loadTimer);
+  $("#mTitle").textContent = title;
+  $("#mBody").innerHTML = html + `<p class="writing">✍️ 답을 쓰는 중… ${Math.round((now - liveT0) / 1000)}초</p>`;
+  $("#mPlaces").hidden = true; $("#mFoot").hidden = true;
+}
 async function run(label, msg, task) {
   if (busy) return;
   if (!aiReady()) { openSettings(); toast("AI 서버가 아직 연결되지 않았어요"); return; }
   busy = true; document.querySelectorAll(".btn").forEach(b => b.disabled = true);
-  loading(msg);
+  loading(msg); liveT0 = Date.now(); liveAt = 0;
   try {
     const r = await task();
     openModal(r.title, r.html, { sources: r.sources, food: r.food, caution: r.caution !== false });
@@ -382,13 +409,27 @@ async function run(label, msg, task) {
     openModal("앗, 잘 안 됐어요", `<p class="err">${esc(e instanceof AppError ? e.message : "알 수 없는 문제가 생겼어요. 다시 해 주세요.")}</p>`, { caution: false, tools: false });
   } finally { clearInterval(loadTimer); busy = false; document.querySelectorAll(".btn").forEach(b => b.disabled = false); }
 }
-const FOOD_JSON = `반드시 아래 JSON 하나만 \`\`\`json 블록으로 답하세요.
-{"name":"메뉴 이름","description":"추천 이유와 간단한 설명","nutrients":["영양소와 효과"],"recipes":[{"title":"레시피 제목","steps":["조리 단계"]}],"caution":"이 질환이 있는 사람이 주의할 점 (없으면 빈 문자열)"}`;
+// 답을 쓰는 대로 바로 보여 줄 수 있게 JSON 대신 정해진 제목의 글로 받는다. 빨리 끝나도록 간결하게.
+const FOOD_FMT = `아래 형식 그대로, 간결하게 답하세요. 표와 JSON은 쓰지 마세요.
+# 메뉴 이름
+추천 이유와 간단한 설명 (2~3문장)
+## 1. 주요 영양성분
+- 영양소: 효과 (3~4개)
+## 2. 추천 레시피
+### 레시피 제목
+1. 조리 단계 (레시피마다 5단계 이내)
+## 3. 주의할 점
+이 질환이 있는 사람이 주의할 점 (없으면 이 부분은 빼세요)`;
+/** "# 메뉴 이름" 줄을 제목으로 쓰고, 나머지를 화면용으로 바꾼다 */
+function foodView(text, titlePrefix, fallbackName) {
+  const m = text.match(/^\s*#\s+(.+)$/m);
+  const name = m ? m[1].replace(/\*\*/g, "").trim() : fallbackName;
+  const body = m ? text.replace(m[0], "") : text;
+  return { title: `${titlePrefix}${name || ""}`, html: mdToHtml(body), food: name || fallbackName };
+}
 async function foodTask(prompt, titlePrefix, fallbackName, opts) {
-  const { text, sources } = await gemini(prompt, opts);
-  const d = pickJson(text);
-  if (d && (d.name || d.description)) return { title: `${titlePrefix}${d.name || fallbackName || ""}`, html: foodHtml(d), sources, food: d.name || fallbackName };
-  return { title: `${titlePrefix}${fallbackName || ""}`, html: mdToHtml(text.replace(/```json[\s\S]*?```/g, "")), sources, food: fallbackName };
+  const { text, sources } = await gemini(prompt, { ...opts, onText: t => { const v = foodView(t, titlePrefix, fallbackName); live(v.title, v.html); } });
+  return { ...foodView(text, titlePrefix, fallbackName), sources };
 }
 
 /* ---------- 1. 식단 · 음료 · 운동 추천 ---------- */
@@ -398,10 +439,10 @@ document.querySelectorAll("[data-rec]").forEach(b => b.onclick = () => {
   const who = cond ? `'${cond}'이(가) 있는 사람을 위한` : "일반적인";
   run(`[${t} 추천] ${cond || "일반"} ${kind}`, "최신 정보를 검색 중입니다...", async () => {
     if (type === "exercise") {
-      const { text, sources } = await gemini(`지금은 대한민국의 ${s}, ${t} 시간입니다. ${who} 건강 운동 1가지를 웹 검색으로 찾아 추천하고, 그 이유와 방법(횟수·시간 포함), 주의할 점을 자연스러운 문장으로 설명해 주세요. JSON은 쓰지 마세요.`);
+      const { text, sources } = await gemini(`지금은 대한민국의 ${s}, ${t} 시간입니다. ${who} 건강 운동 1가지를 웹 검색으로 찾아 추천하고, 그 이유와 방법(횟수·시간 포함), 주의할 점을 간결하게 설명해 주세요. JSON은 쓰지 마세요.`, { onText: t => live("오늘의 운동 추천", mdToHtml(t)) });
       return { title: `오늘의 운동 추천`, html: mdToHtml(text), sources };
     }
-    return foodTask(`지금은 대한민국의 '${s}' '${t}' 시간입니다. ${who} 건강 ${kind} 1가지를 웹 검색으로 찾은 정보를 바탕으로 추천하고, 최대 3개의 다양한 레시피를 포함하세요.\n${FOOD_JSON}`, "오늘의 추천: ", null);
+    return foodTask(`지금은 대한민국의 '${s}' '${t}' 시간입니다. ${who} 건강 ${kind} 1가지를 웹 검색으로 찾은 정보를 바탕으로 추천하고, 서로 다른 레시피 2개를 포함하세요.\n${FOOD_FMT}`, "오늘의 추천: ", null);
   });
 });
 
@@ -410,7 +451,7 @@ function doSearch() {
   const q = $("#search").value.trim();
   if (!q) { $("#search").focus(); toast("음식이나 식재료를 입력해 주세요"); return; }
   run(`[검색] ${q}`, "최신 정보를 검색 중입니다...", () =>
-    foodTask(`'${q}'와(과) 관련된 건강 음식 1가지를 웹 검색으로 찾아 추천하고, 최대 3개의 다양한 레시피를 포함하세요. '${q}' 자체가 음식이면 그 음식을 설명하세요.\n${FOOD_JSON}`, `'${q}' 검색 결과: `, q));
+    foodTask(`'${q}'와(과) 관련된 건강 음식 1가지를 웹 검색으로 찾아 추천하고, 서로 다른 레시피 2개를 포함하세요. '${q}' 자체가 음식이면 그 음식을 설명하세요.\n${FOOD_FMT}`, `'${q}' 검색 결과: `, q));
 }
 $("#btnSearch").onclick = doSearch;
 $("#search").addEventListener("keydown", e => { if (e.key === "Enter") doSearch(); });
@@ -420,7 +461,7 @@ $("#photo").addEventListener("change", async e => {
   if (!file) return;
   const image = await shrinkImage(file);
   run("[사진 검색]", "사진을 분석하고 있습니다...", async () => {
-    const r = await foodTask(`이 사진에 있는 음식(또는 식재료·동식물)의 이름을 알려 주고, 주요 영양성분과 그것을 활용한 다양한 레시피 3개를 추천해 주세요.\n${FOOD_JSON}`, "사진 분석 결과: ", null, { image, search: false });
+    const r = await foodTask(`이 사진에 있는 음식(또는 식재료·동식물)의 이름을 알려 주고, 주요 영양성분과 그것을 활용한 레시피 2개를 추천해 주세요.\n${FOOD_FMT}`, "사진 분석 결과: ", null, { image, search: false });
     return r;
   });
 });
@@ -456,7 +497,7 @@ function findPlaces(food) {
 - 주소: …
 - 전화번호: …
 - 가격대: …
-- 특징: …`);
+- 특징: …`, { onText: t => live(`'${food}' 주변 맛집 찾는 중`, mdToHtml(t)) });
     return { title: `'${food}' 주변 맛집 추천${c ? "" : ` (${region} 기준)`}`, html: mdToHtml(text) + (c ? "" : `<p class="caution">위치 권한이 없어 ⚙ 설정의 기본 지역(${esc(region)})으로 찾았어요.</p>`), sources, caution: false };
   });
 }
@@ -472,7 +513,7 @@ function doWeekly() {
   run(`[주간 식단] ${cond}`, "주간 식단을 만들고 있습니다...", async () => {
     const { text, sources } = await gemini(`'${cond}'을(를) 위한 주간 식단을 웹 검색으로 확인한 정보를 바탕으로 짜 주세요. 월요일부터 일요일까지 아침·점심·저녁 메뉴를 넣으세요.
 반드시 아래 JSON 하나만 \`\`\`json 블록으로 답하세요.
-{"월요일":{"아침":"…","점심":"…","저녁":"…"},"화요일":{…},"수요일":{…},"목요일":{…},"금요일":{…},"토요일":{…},"일요일":{…},"tips":["식단 관리 요령 3가지"]}`);
+{"월요일":{"아침":"…","점심":"…","저녁":"…"},"화요일":{…},"수요일":{…},"목요일":{…},"금요일":{…},"토요일":{…},"일요일":{…},"tips":["식단 관리 요령 3가지"]}`, { onText: t => { loadExtra = `답을 받는 중… ${t.length}자`; } });
     const d = pickJson(text);
     return { title: `${cond} 주간 식단`, html: d && d["월요일"] ? weeklyHtml(d) : mdToHtml(text), sources };
   });
@@ -485,7 +526,7 @@ function doAsk() {
   const q = $("#qa").value.trim();
   if (!q) { $("#qa").focus(); toast("궁금한 점을 입력해 주세요"); return; }
   run(`[질문] ${q}`, "답을 찾고 있습니다...", async () => {
-    const { text, sources } = await gemini(`사용자 질문: "${q}"\n필요하면 웹 검색으로 최신 정보를 확인해서, 전문가로서 자연스러운 문장으로 답해 주세요. JSON은 쓰지 마세요.`);
+    const { text, sources } = await gemini(`사용자 질문: "${q}"\n필요하면 웹 검색으로 최신 정보를 확인해서, 전문가로서 자연스러운 문장으로 간결하게 답해 주세요. JSON은 쓰지 마세요.`, { onText: t => live("질문에 대한 답변", `<p><strong>Q. ${esc(q)}</strong></p>${mdToHtml(t)}`) });
     $("#qa").value = "";
     return { title: "질문에 대한 답변", html: `<p><strong>Q. ${esc(q)}</strong></p>${mdToHtml(text)}`, sources };
   });
